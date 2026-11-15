@@ -1,5 +1,7 @@
 # Personal Foundry PF2e Macros
 
+I could've bothered to make this a Module for Foundry, but maybe we'll tackle that another time.
+
 A collection of macros for **Foundry Virtual Tabletop** and the **Pathfinder Second Edition** game system. The initial focus is Card Macro Studio, a configurable macro that creates other macros for memorable chat cards, transformations, summons, and spell moments.
 
 This is an **AI vibe-coded** project: AI helped design and write the code and documentation. Macros run JavaScript with your Foundry user's permissions, so read the code, test in a development world, and check the results before relying on them in a game.
