@@ -29,7 +29,7 @@ See the [studio guide](meta-macros/README.md) for installation, use, the optiona
 ## Requirements and limitations
 
 - Designed for Foundry VTT 14 and PF2e; behavior, compendium contents, and permissions can vary between versions and worlds. A user needs permission to run Script macros and, where applicable, modify actors, tokens, and effects.
-- **PF2e Toolbelt is optional.** Its Spell Macro feature can link a generated macro to a spell's Cast action; see the [Toolbelt documentation](https://github.com/reonZ/pf2e-toolbelt/wiki/Actionable#spell-macro) and the studio guide. Standalone macros do not cast the originating spell or spend its slot.
+- **PF2e Toolbelt is optional.** Its Spell Macro feature can link a generated macro to a spell's Cast action; see the [Toolbelt documentation](https://github.com/reonZ/pf2e-toolbelt/wiki/Actionable#spell-macro) and the studio guide. Standalone macros do not cast the originating spell or spend its slot. Toolbelt has other Macro linking functionality as well beyond spells.
 - These cards do not automatically detect attacks, saves, or outcomes. The summon picker announces a creature but does not place it or apply Elite/Weak to its statistics. Check spell restrictions, rarity, and access with your GM.
 - No personal images or URLs are included. Optional media fields are blank; provide Foundry-accessible paths such as `path/to/your-image.webp` or `path/to/your-transition.webm`. All viewers need access to shared media.
 - Transformation and effect macros change game data. Test activation and restoration on a copy of an actor and scene first. Restoration depends on the saved state and permissions; it is not a general undo feature.
