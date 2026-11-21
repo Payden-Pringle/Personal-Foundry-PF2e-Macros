@@ -1,6 +1,6 @@
 # Card Macro Studio
 
-Card Macro Studio 1.3 builds self-contained Foundry VTT 14 / PF2e Script macros. It can create art-free cards, use optional artwork or an animated WebP/GIF overlay, and configure common spell, summon, effect, or transformation workflows. It does not create or upload media. See [the example macros](../macros/) for starting recipes.
+Card Macro Studio 1.4 builds self-contained Foundry VTT 14 / PF2e Script macros. It can create art-free cards, use optional artwork or an animated WebP/GIF overlay, watch rolls, and configure common spell, summon, effect, or transformation workflows. It does not create or upload media. See [the example macros](../macros/) for starting recipes.
 
 ## Initial setup
 
@@ -26,13 +26,23 @@ Placeholders include `{actor}`, `{target}`, `{result}`, `{spell}`, `{spellRank}`
 
 - **Chat card only:** post the configured card, including jokes or spell announcements.
 - **Summon creature card:** choose a creature from accessible NPC compendiums, filtered by supported spell, rank, traits, and adjusted level. Common creatures are shown by default. Weak/Elite affects the card and filtering, not the actual creature or scene. Verify special restrictions and rarity.
-- **Choose an outcome:** choose the result manually and post the corresponding text. It does not watch rolls.
+- **Choose an outcome:** choose the result manually and post the corresponding text, or use the optional roll watcher.
 - **Apply effect / changes once:** optionally apply an effect, refresh size, play a transition, and set art.
 - **Transformation toggle:** apply configured changes on one run and attempt to restore them on the next. Existing matching effects are kept; interrupted transformations require the same macro and original scene for recovery.
 - **Temporary token animation:** temporarily replace and restore token art.
 - **Manifestation spell picker:** use the selected casting entry's tradition for spells through rank 9 and the other traditions through rank 7. If the actor or usable entry is unavailable, choose the primary tradition; the resulting descriptive card requires manual checks and heightening. The duplicated spell's effects are not applied automatically.
 
 Token-changing modes can use all matching owned tokens on the viewed scene or only selected matching tokens. Other clients load token textures independently, so timing may differ. Card animation comes from the supplied animated media rather than inline CSS keyframes.
+
+### Watching rolls
+
+For **Chat card only** or **Choose an outcome**, expand **Roll watcher**, enable it, and choose the actor, roll type and outcome. Choose **Any degree of success** to post on all four outcomes; outcome cards use the text matching the actual result. An optional exact PF2e roll option can narrow the match: right-click a roll and select **Inspect Roll** to see its options. A DC or target is needed for PF2e to supply a degree of success; a natural 20 alone is not enough to establish a critical success.
+
+Run the generated macro once after connecting to start watching your own rolls for the selected owned actor. Run it again to stop; the watcher also ends on reload and only runs in your current client. It does not watch rolls made by other users, even when they own the actor. If the assigned character changes, stop and restart the watcher. A reroll is a separate roll and may post another card if it matches.
+
+Enable **Only Reactive Strike** for attack rolls to match a roll explicitly labelled as Reactive Strike or Attack of Opportunity. PF2e does not reliably label a normal Strike as a reaction, so unlabelled attacks cannot be identified automatically. In that case, run the watcher again, select **Mark Next Attack as Reactive**, then make the attack within 60 seconds. The mark is consumed by the next matching attack even if it misses. Any required roll option must still match.
+
+The card normally inherits the triggering roll's recipients and blind status, independent of the current chat mode; **Self only** is also available. For a non-GM, Self only will not post the result of a blind roll to the player. Test with your table's modules and settings. Watchers cannot be combined with Toolbelt spell linking, summon pickers, or token/effect behaviors. **Test Card** only previews the card and does not simulate a roll.
 
 ## Optional PF2e Toolbelt spell linking
 
@@ -51,7 +61,7 @@ The studio editor builds and validates a recipe, renders a preview, and generate
 
 `studioRenderCard` renders escaped user text and validated media paths. The summon picker indexes accessible NPC compendiums and filters records; the Manifestation picker resolves a casting entry or asks for a tradition. The Toolbelt path forwards the original options and callback. Transformations store snapshots and effect markers on actors for best-effort recovery, and refresh token dimensions from PF2e's prepared actor size.
 
-The list in `studioGeneratedSource` explicitly determines which helper functions are included in generated macros. When adding runtime helpers or fields, update defaults, editor controls, validation, the helper list, tests, and this guide. The in-app tutorial is maintained separately in `studioHelpContent` and is not included in generated macros. Previously generated macros need to be loaded and updated to receive runtime changes.
+`studioGeneratedSource` selects runtime helpers for the recipe's behavior. Card, outcome, summon, and watcher macros use specialized entry points; they do not include the transformation or unrelated picker implementations. The full editable recipe stays in the macro's flags. When adding runtime helpers or fields, update defaults, recipe migration, editor controls, validation, the helper selection, tests, and this guide. The in-app tutorial is maintained separately in `studioHelpContent` and is not included in generated macros. Previously generated macros need to be loaded and updated to receive runtime changes.
 
 After changes, run from the repository root:
 
@@ -59,6 +69,7 @@ After changes, run from the repository root:
 node scripts/build-artifacts.cjs
 node scripts/build-artifacts.cjs --check
 node tests/card-macro-studio.test.cjs
+node tests/watchers.test.cjs
 node tests/artifacts.test.cjs
 ```
 

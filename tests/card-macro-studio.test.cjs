@@ -3,11 +3,17 @@ const path = require('node:path');
 const assert = require('node:assert/strict');
 const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
 const program = fs.readFileSync(path.join(__dirname, '..', 'meta-macros', 'card-macro-studio.js'), 'utf8')
-  .replace('await studioOpen();', 'return { studioDefaults, studioMacroData, studioRenderCard, studioSafePath, studioManifestationDraft, studioManifestationLimit, studioResolveCasting, studioLinkedSummonSettings, studioLinkedMessageMode, studioResumeLinkedCast, studioEditor, studioValidate, studioSummonRules, studioSummonMaxLevel, studioSummonAdjustedLevel, studioSummonName, studioSummonEligible, studioSummonImage, studioIndexCreatures, studioHash, studioCommandMatches, studioHelpContent, studioShowHelp };');
+  .replace('await studioOpen();', 'return { studioDefaults, studioNormalizeRecipe, studioMacroData, studioRenderCard, studioSafePath, studioManifestationDraft, studioManifestationLimit, studioResolveCasting, studioLinkedSummonSettings, studioLinkedMessageMode, studioResumeLinkedCast, studioEditor, studioValidate, studioSummonRules, studioSummonMaxLevel, studioSummonAdjustedLevel, studioSummonName, studioSummonEligible, studioSummonImage, studioIndexCreatures, studioHash, studioCommandMatches, studioHelpContent, studioShowHelp };');
+
+function injectBeforeEntry(source, setup) {
+  const marker = /await studioRun(?:Card|Change|Temporary)Recipe\(CARD_RECIPE, CARD_INVOCATION(?:, \w+)?\);/;
+  assert.match(source, marker, 'generated entry point must exist');
+  return source.replace(marker, match => `${setup}\n${match}`);
+}
 
 function fixture({ linked = true, synthetic = false, initialEffect = false } = {}) {
   const events = [], messages = [], warnings = [], errors = [], registry = new Map();
-  let n = 0, failNextTokenUpdate = false;
+  let n = 0, failNextTokenUpdate = false, messageMode = 'public';
   function makeActor(uuid) {
     const actor = {
       id: 'example', uuid, name: 'Example Caster', img: 'human.webp', isToken: uuid.startsWith('Scene.'),
@@ -64,8 +70,13 @@ function fixture({ linked = true, synthetic = false, initialEffect = false } = {
   global.fromUuid = async uuid => registry.get(uuid);
   global.ui = { notifications: { info: text => events.push('info:' + text), warn: text => warnings.push(text), error: text => errors.push(text) } };
   global.ChatMessage = { getSpeaker: data => data || {}, create: async data => { events.push('chat'); messages.push(data); } };
-  global.CONFIG = { ChatMessage: { documentClass: { create: async data => messages.push(data) } } };
-  return { actor, world, doc, events, messages, warnings, errors, registry, failToken: () => { failNextTokenUpdate = true; } };
+  global.CONFIG = { ChatMessage: { documentClass: {
+    create: async data => messages.push(data),
+    applyMode: (data, mode = messageMode) => ({ ...data,
+      whisper: mode === 'self' ? ['player'] : ['gm', 'blind'].includes(mode) ? ['gm'] : [], blind: mode === 'blind' })
+  } } };
+  return { actor, world, doc, events, messages, warnings, errors, registry,
+    setMessageMode: mode => { messageMode = mode; }, failToken: () => { failNextTokenUpdate = true; } };
 }
 
 (async () => {
@@ -149,17 +160,26 @@ function fixture({ linked = true, synthetic = false, initialEffect = false } = {
   assert(!f.events.some(event => event.startsWith('effect:')));
 
   f = fixture();
+  f.setMessageMode('self');
+  await new AsyncFunction(studio.studioMacroData(artless).command)();
+  assert.deepEqual(f.messages[0].whisper, ['player'], 'standalone card follows the current Self Only mode');
+  f.setMessageMode('blind');
+  await new AsyncFunction(studio.studioMacroData(artless).command)();
+  assert.deepEqual(f.messages[1].whisper, ['gm'], 'standalone card follows the current GM mode');
+  assert.equal(f.messages[1].blind, true, 'standalone card preserves blind visibility');
+
+  f = fixture();
   const picked = studio.studioDefaults(); picked.mode = 'summon'; picked.card.title = 'THE CALL';
   picked.card.paragraphs = ['{summon} answers {actor}.']; picked.card.artMode = 'summon';
   const mockSummon = { displayName:'Weak Wolf', level:-1, rank:1, spellName:'Summon Animal', adjustmentLabel:'Weak', image:'wolf.webp' };
-  const pickedCode = studio.studioMacroData(picked).command.replace('await studioRunRecipe(CARD_RECIPE, CARD_INVOCATION);', `studioChooseSummon = async () => (${JSON.stringify(mockSummon)}); await studioRunRecipe(CARD_RECIPE, CARD_INVOCATION);`);
+  const pickedCode = injectBeforeEntry(studio.studioMacroData(picked).command, `studioChooseSummon = async () => (${JSON.stringify(mockSummon)});`);
   await new AsyncFunction(pickedCode)();
   assert.match(f.messages[0].content, /Weak Wolf answers Example Caster/);
   assert.match(f.messages[0].content, /Level -1/);
   assert.match(f.messages[0].content, /Summon Animal/);
   assert.match(f.messages[0].content, /src="wolf\.webp"/);
   picked.card.artMode = 'none';
-  const noArtCode = studio.studioMacroData(picked).command.replace('await studioRunRecipe(CARD_RECIPE, CARD_INVOCATION);', `studioChooseSummon = async () => (${JSON.stringify(mockSummon)}); await studioRunRecipe(CARD_RECIPE, CARD_INVOCATION);`);
+  const noArtCode = injectBeforeEntry(studio.studioMacroData(picked).command, `studioChooseSummon = async () => (${JSON.stringify(mockSummon)});`);
   await new AsyncFunction(noArtCode)();
   assert(!f.messages[1].content.includes('<img'));
 
@@ -312,8 +332,7 @@ function fixture({ linked = true, synthetic = false, initialEffect = false } = {
   await assert.rejects(() => studio.studioManifestationDraft(null, null, { uuid:'Spell.test', rank:8 }, 'divine'), /not eligible/);
 
   const runGenerated = (recipe, setup='') => {
-    const marker = 'await studioRunRecipe(CARD_RECIPE, CARD_INVOCATION);';
-    const source = studio.studioMacroData(recipe).command.replace(marker, `${setup}\n${marker}`);
+    const source = injectBeforeEntry(studio.studioMacroData(recipe).command, setup);
     return new AsyncFunction('actor', 'spell', 'options', 'cast', 'observe', source);
   };
   f = fixture();

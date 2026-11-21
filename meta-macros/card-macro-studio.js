@@ -1,7 +1,7 @@
 // Card Macro Studio for Foundry VTT 14 and PF2e.
 // Run this as a Script macro. Generated macros are self-contained.
 
-const STUDIO_VERSION = "1.3.0";
+const STUDIO_VERSION = "1.4.0";
 const STUDIO_FLAG = "cardMacroStudio";
 const STUDIO_THEMES = {
   divine:  { label: "Divine light", background: "#182846", panel: "#0b1323", accent: "#e8cc83", text: "#fff8e8" },
@@ -147,7 +147,8 @@ function studioHelpContent() {
       <li><strong>Transformation toggle:</strong> apply changes on one run and restore them on the next.</li>
       <li><strong>Temporary token animation:</strong> briefly replace and restore token art.</li>
       <li><strong>Manifestation spell picker:</strong> choose an eligible spell and post its PF2e card.</li>
-    </ul><p>Outcome cards ask you to choose the result; they do not watch rolls.</p>`],
+    </ul><p>Chat and outcome cards can optionally watch your actor's PF2e rolls. Choose a roll type and degree of success; outcome cards use the matching outcome text. The watcher runs in this client until stopped or reloaded.</p>
+      <p>Reactive Strike rolls are not always labelled. If needed, run the watcher again and mark the next attack before rolling. An optional exact roll option can narrow the watcher; right-click a roll and use Inspect Roll to find its options. A DC or target is needed for a degree of success.</p>`],
     ["Actors, targets, and placeholders", `<p><strong>My assigned character</strong> uses the current user's assigned actor. You can instead choose an owned actor or, for card-only uses, no actor. Token-changing modes need an owned actor and the relevant permissions.</p>
       <p>Use <code>{actor}</code>, <code>{target}</code>, and <code>{result}</code> in card text. <code>{target}</code> refers to your first targeted token; targeting is separate from selecting a token.</p>
       <p>Summon cards also support <code>{summon}</code>, <code>{summonLevel}</code>, <code>{summonSpell}</code>, <code>{summonRank}</code>, and <code>{summonAdjustment}</code>.</p>`],
@@ -803,14 +804,13 @@ async function studioRestore(group, state, key, config, playTransition) {
 }
 
 function studioLinkedMessageMode(data, linked) {
-  if (!linked) return data;
-  const raw = linked.options?.messageMode ?? linked.options?.rollMode;
+  const raw = linked?.options?.messageMode ?? linked?.options?.rollMode;
   const modes = { publicroll: "public", gmroll: "gm", blindroll: "blind", selfroll: "self", roll: undefined };
   const mode = Object.hasOwn(modes, raw) ? modes[raw] : raw;
   if (mode != null && !["public", "gm", "blind", "self"].includes(mode)) throw new Error("The linked cast has an unsupported message visibility mode.");
   const cls = globalThis.CONFIG?.ChatMessage?.documentClass ?? globalThis.ChatMessage;
   if (typeof cls?.applyMode === "function") return cls.applyMode(data, mode);
-  if (mode && mode !== "public") throw new Error("Cannot safely preserve the linked cast's message visibility.");
+  if (mode !== "public") throw new Error("Cannot safely apply the selected message visibility.");
   return data;
 }
 
@@ -823,7 +823,8 @@ async function studioResumeLinkedCast(linked, rank) {
   return true;
 }
 
-async function studioRunRecipe(recipe, invocation = {}) {
+// Card, outcome, and summon macros do not need token or effect handling.
+async function studioRunCardRecipe(recipe, invocation = {}, choose = null) {
   const hasLinkedCast = !!invocation.spell && typeof invocation.cast === "function";
   if (hasLinkedCast && !recipe.behavior?.toolbeltSpellMacro) {
     ui.notifications.warn("This macro was invoked by Toolbelt, but spell linking is not enabled in its studio settings; the spell was not cast.");
@@ -834,9 +835,153 @@ async function studioRunRecipe(recipe, invocation = {}) {
   let actor = linked?.actor ?? linked?.spell?.actor ?? null;
   if (!actor) actor = recipe.actorBinding === "none" ? null : recipe.actorBinding === "assigned"
     ? game.user.character : await fromUuid(recipe.actorBinding);
-  if (recipe.actorBinding !== "none" && !actor && recipe.mode !== "manifestation") { ui.notifications.warn("The configured actor could not be found."); return; }
-  const needsActor = ["apply", "transform", "temporary"].includes(recipe.mode);
-  if ((needsActor && !actor?.isOwner) || (recipe.mode === "manifestation" && actor && !actor.isOwner)) {
+  if (recipe.actorBinding !== "none" && !actor) { ui.notifications.warn("The configured actor could not be found."); return; }
+  const lockKey = `${recipe.id}:${actor?.uuid ?? game.user.id}`;
+  globalThis.cardMacroStudioLocks ??= new Set();
+  if (globalThis.cardMacroStudioLocks.has(lockKey)) { ui.notifications.warn("This macro is already running."); return; }
+  globalThis.cardMacroStudioLocks.add(lockKey);
+  try {
+    const selection = choose ? await choose(recipe, linked) : {};
+    if (!selection) return;
+    const linkedRank = Number(linked?.options?.rank ?? linked?.spell?.rank);
+    if (selection.castRank != null && linked && Number.isInteger(linkedRank) && selection.castRank !== linkedRank) throw new Error("The chosen rank does not match the linked spell cast.");
+    const context = { actor, spellName: linked?.spell?.name ?? "", spellRank: Number.isInteger(linkedRank) ? linkedRank : null,
+      tradition: linked?.spell?.spellcasting?.tradition ?? "", ...studioTarget(), ...selection.cardContext };
+    const showMessages = linked?.options?.message !== false;
+    if (linked && showMessages) studioLinkedMessageMode({}, linked);
+    if (!await studioResumeLinkedCast(linked, selection.castRank)) return;
+    if (showMessages) await ChatMessage.create(studioLinkedMessageMode({
+      speaker: actor ? ChatMessage.getSpeaker({ actor }) : ChatMessage.getSpeaker(),
+      content: studioRenderCard(recipe, context)
+    }, linked));
+  } catch (error) {
+    console.error("Card Macro Studio generated macro failed", error);
+    ui.notifications.error(`${recipe.name}: ${error.message}`);
+  } finally { globalThis.cardMacroStudioLocks.delete(lockKey); }
+}
+
+async function studioSelectCardResult(recipe) {
+  const outcome = await studioChooseResult(recipe);
+  return outcome ? { cardContext: outcome } : null;
+}
+
+async function studioSelectCardSummon(recipe, linked) {
+  const settings = linked ? studioLinkedSummonSettings(recipe.summon, linked) : recipe.summon;
+  const summon = await studioChooseSummon(settings);
+  return summon ? { cardContext: { summon }, castRank: summon.rank } : null;
+}
+
+// Watch only the selected actor's own rolls on this client. PF2e does not
+// always label a Strike as a reaction, so reactive-only watchers also allow
+// the user to explicitly mark the next attack.
+async function studioRunWatcher(recipe) {
+  const watch = recipe.behavior.watch;
+  globalThis.cardMacroStudioWatchers ??= new Map();
+  const watchers = globalThis.cardMacroStudioWatchers;
+  const old = watchers.get(recipe.id);
+  if (old) {
+    const buttons = [];
+    if (old.reactiveOnly) buttons.push({ action: "arm", label: "Mark Next Attack as Reactive", default: true });
+    buttons.push({ action: "stop", label: "Stop Watching", default: !old.reactiveOnly }, { action: "cancel", label: "Cancel" });
+    const choice = await foundry.applications.api.DialogV2.wait({
+      window: { title: `${recipe.name}: Watcher` },
+      content: studioDialogContent(old.reactiveOnly
+        ? "<p>Mark your next attack as Reactive if the roll is not labelled, or stop this watcher.</p>"
+        : "<p>This watcher is already running in this client.</p>"),
+      buttons, rejectClose: false
+    });
+    if (choice === "arm") {
+      old.armedUntil = Date.now() + 60000;
+      ui.notifications.info(`${recipe.name}: the next attack is marked as Reactive for 60 seconds.`);
+    } else if (choice === "stop") {
+      Hooks.off("createChatMessage", old.hookId);
+      watchers.delete(recipe.id);
+      ui.notifications.info(`${recipe.name}: watcher stopped.`);
+    }
+    return;
+  }
+
+  const actor = recipe.actorBinding === "assigned" ? game.user.character : await fromUuid(recipe.actorBinding);
+  if (!actor?.isOwner) { ui.notifications.warn(`${recipe.name}: choose an owned actor before starting the watcher.`); return; }
+  const state = { hookId: null, reactiveOnly: !!watch.reactiveOnly, armedUntil: 0, posted: new Set() };
+  const names = { criticalSuccess: "Critical success", success: "Success", failure: "Failure", criticalFailure: "Critical failure" };
+  const onMessage = async (message, _options, userId) => {
+    const authorId = userId ?? message.author?.id ?? message.user?.id ?? message.user;
+    if (authorId !== game.user.id) return;
+    const context = message.flags?.pf2e?.context;
+    if (!context || (watch.type !== "any" && context.type !== watch.type)) return;
+    if (watch.type === "any" && !["attack-roll", "saving-throw", "skill-check", "perception-check", "check", "counteract-check", "flat-check", "initiative"].includes(context.type)) return;
+    if (context.actor !== actor.id && context.actor !== actor.uuid && message.speaker?.actor !== actor.id && message.actor?.id !== actor.id) return;
+    const options = new Set(Array.isArray(context.options) ? context.options : []);
+    const requiredOption = String(watch.requiredOption ?? "").trim();
+    if (requiredOption && !options.has(requiredOption)) return;
+    if (watch.reactiveOnly) {
+      const action = context.action ?? message.rolls?.[0]?.options?.action;
+      const tagged = ["action:reactive-strike", "reactive-strike", "action:attack-of-opportunity", "attack-of-opportunity"].some(option => options.has(option)) ||
+        (typeof action === "string" && ["reactive-strike", "attack-of-opportunity"].includes(action.toLowerCase()));
+      if (!tagged && Date.now() >= state.armedUntil) return;
+      state.armedUntil = 0; // Consume an explicit mark even when this attack misses.
+    }
+    const outcome = context.outcome ?? ["criticalFailure", "failure", "success", "criticalSuccess"][message.rolls?.[0]?.options?.degreeOfSuccess];
+    if (!names[outcome]) { ui.notifications.warn(`${recipe.name}: the roll has no degree of success; provide a DC or target.`); return; }
+    if (watch.outcome !== "any" && watch.outcome !== outcome) return;
+    if (message.id && state.posted.has(message.id)) return;
+    if (message.blind && watch.visibility === "self" && !game.user.isGM) {
+      ui.notifications.warn(`${recipe.name}: a blind roll cannot be posted to yourself. Use roll visibility instead.`);
+      return;
+    }
+    if (message.id) state.posted.add(message.id);
+    try {
+      let targetName = "", targetImage = "";
+      const targetUuid = context.target?.token ?? context.target?.actor;
+      if (targetUuid) {
+        try {
+          const target = await fromUuid(targetUuid);
+          targetName = target?.name ?? target?.actor?.name ?? "";
+          targetImage = target?.ring?.enabled && target.ring.subject?.texture ? target.ring.subject.texture :
+            target?.texture?.src ?? target?.actor?.img ?? target?.img ?? "";
+        } catch (error) { console.warn("Card Macro Studio could not resolve the roll target", error); }
+      }
+      const cardContext = { actor, targetName, targetImage, resultLabel: names[outcome],
+        ...(recipe.mode === "result" ? { resultText: recipe.results[outcome] } : {}) };
+      const cls = globalThis.CONFIG?.ChatMessage?.documentClass ?? globalThis.ChatMessage;
+      const recipients = [...(message.whisper ?? [])].map(user => typeof user === "string" ? user : user.id).filter(Boolean);
+      const mode = watch.visibility === "self" ? "self" : message.blind ? "blind" : !recipients.length ? "public" :
+        recipients.length === 1 && recipients[0] === game.user.id ? "self" : "gm";
+      const data = { speaker: { ...message.speaker }, content: studioRenderCard(recipe, cardContext),
+        whisper: recipients, blind: !!message.blind,
+        flags: { world: { cardMacroStudioWatcher: { sourceMessageId: message.id } } } };
+      if (typeof cls?.applyMode !== "function") throw new Error("Cannot safely apply the roll's chat visibility.");
+      await cls.create(cls.applyMode(data, mode), { messageMode: mode });
+    } catch (error) {
+      if (message.id) state.posted.delete(message.id);
+      console.error("Card Macro Studio watcher could not post", error);
+      ui.notifications.error(`${recipe.name}: could not post the card: ${error.message}`);
+    }
+  };
+  state.hookId = Hooks.on("createChatMessage", (...args) => {
+    void onMessage(...args).catch(error => {
+      console.error("Card Macro Studio watcher failed", error);
+      ui.notifications.error(`${recipe.name}: watcher failed: ${error.message}`);
+    });
+  });
+  watchers.set(recipe.id, state);
+  ui.notifications.info(`${recipe.name}: watching ${actor.name}'s rolls. Run again to manage the watcher.`);
+}
+
+async function studioRunChangeRecipe(recipe, invocation = {}) {
+  const hasLinkedCast = !!invocation.spell && typeof invocation.cast === "function";
+  if (hasLinkedCast && !recipe.behavior?.toolbeltSpellMacro) {
+    ui.notifications.warn("This macro was invoked by Toolbelt, but spell linking is not enabled in its studio settings; the spell was not cast.");
+    return;
+  }
+  const linked = hasLinkedCast ? invocation : null;
+  if (recipe.behavior?.toolbeltSpellMacro && !linked) ui.notifications.warn("No Toolbelt spell cast was provided. Running standalone; this macro will not cast or spend a spell slot.");
+  let actor = linked?.actor ?? linked?.spell?.actor ?? null;
+  if (!actor) actor = recipe.actorBinding === "none" ? null : recipe.actorBinding === "assigned"
+    ? game.user.character : await fromUuid(recipe.actorBinding);
+  if (recipe.actorBinding !== "none" && !actor) { ui.notifications.warn("The configured actor could not be found."); return; }
+  if (!actor?.isOwner) {
     ui.notifications.warn("This macro needs an actor you own."); return;
   }
   const lockKey = `${recipe.id}:${actor?.uuid ?? game.user.id}`;
@@ -844,35 +989,22 @@ async function studioRunRecipe(recipe, invocation = {}) {
   if (globalThis.cardMacroStudioLocks.has(lockKey)) { ui.notifications.warn("This macro is already running."); return; }
   globalThis.cardMacroStudioLocks.add(lockKey);
   try {
-    const outcome = recipe.mode === "result" ? await studioChooseResult(recipe) : {};
-    if (!outcome) return;
-    const summonSettings = recipe.mode === "summon" && linked ? studioLinkedSummonSettings(recipe.summon, linked) : recipe.summon;
-    const summon = recipe.mode === "summon" ? await studioChooseSummon(summonSettings) : null;
-    if (recipe.mode === "summon" && !summon) return;
-    const manifested = recipe.mode === "manifestation" ? await studioManifestation(actor, linked?.spell) : null;
-    if (recipe.mode === "manifestation" && !manifested) return;
     const linkedRank = Number(linked?.options?.rank ?? linked?.spell?.rank);
-    if (summon && linked && Number.isInteger(linkedRank) && summon.rank !== linkedRank) throw new Error("The chosen summon rank does not match the linked spell cast.");
-    const context = { actor, summon, spellName: linked?.spell?.name ?? "", spellRank: Number.isInteger(linkedRank) ? linkedRank : null,
-      tradition: manifested?.primary ?? linked?.spell?.spellcasting?.tradition ?? "", ...studioTarget(), ...outcome };
+    const context = { actor, spellName: linked?.spell?.name ?? "", spellRank: Number.isInteger(linkedRank) ? linkedRank : null,
+      tradition: linked?.spell?.spellcasting?.tradition ?? "", ...studioTarget() };
     const showMessages = linked?.options?.message !== false;
     if (linked && showMessages) studioLinkedMessageMode({}, linked); // Fail before casting if visibility cannot be preserved.
     const postCard = async () => showMessages ? ChatMessage.create(studioLinkedMessageMode({
       speaker: context.actor ? ChatMessage.getSpeaker({ actor: context.actor }) : ChatMessage.getSpeaker(),
       content: studioRenderCard(recipe, context)
     }, linked)) : null;
-    if (["card", "result", "summon"].includes(recipe.mode)) {
-      if (!await studioResumeLinkedCast(linked, summon?.rank)) return;
-      await postCard(); return;
-    }
     const docs = studioTokens(actor, recipe.behavior.tokenScope);
     const groups = studioGroups(actor, docs);
     if (groups.length === 1) context.actor = groups[0].actor;
     const key = `cardMacroStudio_${recipe.id}`;
     const active = groups.map(group => ({ group, state: group.actor.getFlag("world", key) })).filter(entry => entry.state);
 
-    if (actor && recipe.behavior.tokenScope === "selected" && !docs.length && !active.length &&
-      (recipe.mode !== "manifestation" || recipe.behavior.transitionPath)) {
+    if (actor && recipe.behavior.tokenScope === "selected" && !docs.length && !active.length) {
       ui.notifications.warn("Select a matching owned token, or change the token scope to the current scene."); return;
     }
     if (!docs.length && recipe.behavior.tokenScope === "scene" &&
@@ -886,11 +1018,6 @@ async function studioRunRecipe(recipe, invocation = {}) {
       if (recipe.behavior.postWhen === "both") await postCard();
       return;
     }
-    if (["temporary", "manifestation"].includes(recipe.mode) && active.length) {
-      for (const { group, state } of active) await studioRestore(group, state, key, recipe.behavior, false);
-      ui.notifications.info("Recovered the previous interrupted transition. Run the macro again to start a new one.");
-      return;
-    }
     if (recipe.mode === "apply" && active.length) {
       for (const { group, state } of active) await studioRestore(group, state, key, recipe.behavior, false);
       ui.notifications.info("Recovered the previous interrupted update. Run the macro again to apply it.");
@@ -898,29 +1025,6 @@ async function studioRunRecipe(recipe, invocation = {}) {
     }
 
     if (!await studioResumeLinkedCast(linked)) return;
-
-    if (["temporary", "manifestation"].includes(recipe.mode)) {
-      if (docs.length) await studioPreload([recipe.behavior.transitionPath, ...docs.flatMap(doc => [doc.texture?.src, doc.ring?.subject?.texture])]);
-      await postCard();
-      const transition = studioSafePath(recipe.behavior.transitionPath);
-      if (transition && docs.length) {
-        const saved = [];
-        try {
-          for (const group of groups) {
-            const state = studioSnapshot(group.actor, group.documents, studioId(), canvas.scene?.uuid ?? null, recipe.behavior, recipe.mode);
-            state.tokenWrites = [transition];
-            await group.actor.setFlag("world", key, state);
-            saved.push({ group, state });
-            for (const doc of group.documents) await studioImage(doc, transition, true, false);
-          }
-          await new Promise(resolve => setTimeout(resolve, recipe.behavior.activateMs));
-        } finally {
-          for (const { group, state } of saved) await studioRestore(group, state, key, { ...recipe.behavior, syncSize: false }, false);
-        }
-      } else if (transition && !docs.length) ui.notifications.warn("No matching token was found for the transition.");
-      if (manifested?.message && showMessages) await CONFIG.ChatMessage.documentClass.create(studioLinkedMessageMode(manifested.message, linked));
-      return;
-    }
 
     const finalToken = studioSafePath(recipe.behavior.tokenPath);
     const finalPortrait = studioSafePath(recipe.behavior.portraitPath);
@@ -964,6 +1068,79 @@ async function studioRunRecipe(recipe, invocation = {}) {
   } finally { globalThis.cardMacroStudioLocks.delete(lockKey); }
 }
 
+async function studioRunTemporaryRecipe(recipe, invocation = {}, choose = null) {
+  const hasLinkedCast = !!invocation.spell && typeof invocation.cast === "function";
+  if (hasLinkedCast && !recipe.behavior?.toolbeltSpellMacro) {
+    ui.notifications.warn("This macro was invoked by Toolbelt, but spell linking is not enabled in its studio settings; the spell was not cast.");
+    return;
+  }
+  const linked = hasLinkedCast ? invocation : null;
+  if (recipe.behavior?.toolbeltSpellMacro && !linked) ui.notifications.warn("No Toolbelt spell cast was provided. Running standalone; this macro will not cast or spend a spell slot.");
+  let actor = linked?.actor ?? linked?.spell?.actor ?? null;
+  if (!actor) actor = recipe.actorBinding === "none" ? null : recipe.actorBinding === "assigned"
+    ? game.user.character : await fromUuid(recipe.actorBinding);
+  if (recipe.actorBinding !== "none" && !actor && !choose) { ui.notifications.warn("The configured actor could not be found."); return; }
+  if ((!choose && !actor?.isOwner) || (choose && actor && !actor.isOwner)) {
+    ui.notifications.warn("This macro needs an actor you own."); return;
+  }
+  const lockKey = `${recipe.id}:${actor?.uuid ?? game.user.id}`;
+  globalThis.cardMacroStudioLocks ??= new Set();
+  if (globalThis.cardMacroStudioLocks.has(lockKey)) { ui.notifications.warn("This macro is already running."); return; }
+  globalThis.cardMacroStudioLocks.add(lockKey);
+  try {
+    const selection = choose ? await choose(actor, linked?.spell) : null;
+    if (choose && !selection) return;
+    const linkedRank = Number(linked?.options?.rank ?? linked?.spell?.rank);
+    const context = { actor, spellName: linked?.spell?.name ?? "", spellRank: Number.isInteger(linkedRank) ? linkedRank : null,
+      tradition: selection?.primary ?? linked?.spell?.spellcasting?.tradition ?? "", ...studioTarget() };
+    const showMessages = linked?.options?.message !== false;
+    if (linked && showMessages) studioLinkedMessageMode({}, linked);
+    const docs = studioTokens(actor, recipe.behavior.tokenScope);
+    const groups = studioGroups(actor, docs);
+    if (groups.length === 1) context.actor = groups[0].actor;
+    const key = `cardMacroStudio_${recipe.id}`;
+    const active = groups.map(group => ({ group, state: group.actor.getFlag("world", key) })).filter(entry => entry.state);
+    if (actor && recipe.behavior.tokenScope === "selected" && !docs.length && !active.length && (!choose || recipe.behavior.transitionPath)) {
+      ui.notifications.warn("Select a matching owned token, or change the token scope to the current scene."); return;
+    }
+    if (!docs.length && recipe.behavior.tokenScope === "scene" &&
+      (recipe.behavior.syncSize || recipe.behavior.tokenPath || recipe.behavior.transitionPath)) {
+      ui.notifications.warn("No matching token is on this scene; token changes cannot be applied.");
+    }
+    if (active.length) {
+      for (const { group, state } of active) await studioRestore(group, state, key, recipe.behavior, false);
+      ui.notifications.info("Recovered the previous interrupted transition. Run the macro again to start a new one.");
+      return;
+    }
+    if (!await studioResumeLinkedCast(linked)) return;
+    if (docs.length) await studioPreload([recipe.behavior.transitionPath, ...docs.flatMap(doc => [doc.texture?.src, doc.ring?.subject?.texture])]);
+    if (showMessages) await ChatMessage.create(studioLinkedMessageMode({
+      speaker: context.actor ? ChatMessage.getSpeaker({ actor: context.actor }) : ChatMessage.getSpeaker(),
+      content: studioRenderCard(recipe, context)
+    }, linked));
+    const transition = studioSafePath(recipe.behavior.transitionPath);
+    if (transition && docs.length) {
+      const saved = [];
+      try {
+        for (const group of groups) {
+          const state = studioSnapshot(group.actor, group.documents, studioId(), canvas.scene?.uuid ?? null, recipe.behavior, recipe.mode);
+          state.tokenWrites = [transition];
+          await group.actor.setFlag("world", key, state);
+          saved.push({ group, state });
+          for (const doc of group.documents) await studioImage(doc, transition, true, false);
+        }
+        await new Promise(resolve => setTimeout(resolve, recipe.behavior.activateMs));
+      } finally {
+        for (const { group, state } of saved) await studioRestore(group, state, key, { ...recipe.behavior, syncSize: false }, false);
+      }
+    } else if (transition && !docs.length) ui.notifications.warn("No matching token was found for the transition.");
+    if (selection?.message && showMessages) await CONFIG.ChatMessage.documentClass.create(studioLinkedMessageMode(selection.message, linked));
+  } catch (error) {
+    console.error("Card Macro Studio generated macro failed", error);
+    ui.notifications.error(`${recipe.name}: ${error.message}. If a transformation was interrupted, run it again to restore.`);
+  } finally { globalThis.cardMacroStudioLocks.delete(lockKey); }
+}
+
 function studioDefaults() {
   return {
     schemaVersion: 1, id: studioId(), name: "My Special Moment", icon: "icons/svg/d20.svg",
@@ -979,9 +1156,20 @@ function studioDefaults() {
     summon: { spell: "animal", rank: 1, adjustment: "normal", tradition: "", includeNonCommon: false, customTraits: "" },
     behavior: {
       tokenScope: "scene", toolbeltSpellMacro: false, effectEnabled: false, effectUuid: "", effectRank: 0, syncSize: false,
-      tokenPath: "", portraitPath: "", prototypeToken: false, transitionPath: "", activateMs: 5000, reverseMs: 4000, postWhen: "activate"
+      tokenPath: "", portraitPath: "", prototypeToken: false, transitionPath: "", activateMs: 5000, reverseMs: 4000, postWhen: "activate",
+      watch: { enabled: false, type: "attack-roll", outcome: "criticalSuccess", reactiveOnly: false, requiredOption: "", visibility: "source" }
     }
   };
+}
+
+// Recipes saved by older studio versions have no watcher settings.
+function studioNormalizeRecipe(recipe) {
+  const defaults = studioDefaults();
+  return { ...defaults, ...recipe,
+    card: { ...defaults.card, ...recipe.card }, results: { ...defaults.results, ...recipe.results },
+    summon: { ...defaults.summon, ...recipe.summon },
+    behavior: { ...defaults.behavior, ...recipe.behavior,
+      watch: { ...defaults.behavior.watch, ...recipe.behavior?.watch } } };
 }
 
 function studioExampleSummon(config = {}) {
@@ -994,13 +1182,47 @@ function studioExampleSummon(config = {}) {
 }
 
 function studioGeneratedSource(recipe) {
-  const helpers = [studioEscape, studioSafePath, studioColor, studioText, studioRenderCard,
-    studioId, studioDialogContent, studioTarget, studioChooseResult,
-    studioSummonRules, studioSummonMaxLevel, studioSummonAdjustedLevel, studioSummonName, studioSummonEligible, studioSummonImage, studioIndexCreatures, studioLinkedSummonSettings, studioChooseSummon,
-    studioManifestationLimit, studioResolveCasting, studioManifestationDraft, studioManifestation,
-    studioTokens, studioGroups, studioSyncSize, studioPreload, studioAddEffect, studioSnapshot,
-    studioImage, studioRestore, studioLinkedMessageMode, studioResumeLinkedCast, studioRunRecipe];
-  return `// Generated by Card Macro Studio ${STUDIO_VERSION}. Reopen it in the studio to edit.\n${helpers.map(fn => fn.toString()).join("\n\n")}\n\nconst CARD_RECIPE = ${JSON.stringify(recipe, null, 2)};\nconst CARD_INVOCATION = { actor: typeof actor === "undefined" ? null : actor, spell: typeof spell === "undefined" ? null : spell, options: typeof options === "undefined" ? null : options, cast: typeof cast === "function" ? cast : null };\nawait studioRunRecipe(CARD_RECIPE, CARD_INVOCATION);\n`;
+  const helpers = [studioEscape, studioSafePath, studioColor, studioText, studioRenderCard];
+  const watch = !!recipe.behavior?.watch?.enabled;
+  const simple = ["card", "result", "summon"].includes(recipe.mode);
+  let runtimeRecipe = recipe;
+  let entry;
+  if (watch) {
+    helpers.push(studioDialogContent, studioRunWatcher);
+    runtimeRecipe = { id: recipe.id, name: recipe.name, mode: recipe.mode, actorBinding: recipe.actorBinding,
+      card: recipe.card, behavior: { watch: recipe.behavior.watch }, ...(recipe.mode === "result" ? { results: recipe.results } : {}) };
+    entry = "await studioRunWatcher(CARD_RECIPE);";
+  } else if (simple) {
+    helpers.push(studioTarget, studioLinkedMessageMode, studioResumeLinkedCast);
+    let chooser = "null";
+    if (recipe.mode === "result") {
+      helpers.push(studioDialogContent, studioChooseResult, studioSelectCardResult);
+      chooser = "studioSelectCardResult";
+    } else if (recipe.mode === "summon") {
+      helpers.push(studioDialogContent, studioSummonRules, studioSummonMaxLevel, studioSummonAdjustedLevel, studioSummonName,
+        studioSummonEligible, studioSummonImage, studioIndexCreatures, studioLinkedSummonSettings, studioChooseSummon, studioSelectCardSummon);
+      chooser = "studioSelectCardSummon";
+    }
+    helpers.push(studioRunCardRecipe);
+    runtimeRecipe = { id: recipe.id, name: recipe.name, mode: recipe.mode, actorBinding: recipe.actorBinding, card: recipe.card,
+      behavior: { toolbeltSpellMacro: recipe.behavior.toolbeltSpellMacro },
+      ...(recipe.mode === "result" ? { results: recipe.results } : {}),
+      ...(recipe.mode === "summon" ? { summon: recipe.summon } : {}) };
+    entry = `await studioRunCardRecipe(CARD_RECIPE, CARD_INVOCATION, ${chooser});`;
+  } else {
+    helpers.push(studioId, studioTarget, studioTokens, studioGroups, studioSyncSize, studioPreload,
+      studioSnapshot, studioImage, studioRestore, studioLinkedMessageMode, studioResumeLinkedCast);
+    if (["temporary", "manifestation"].includes(recipe.mode)) {
+      if (recipe.mode === "manifestation") helpers.push(studioDialogContent, studioManifestationLimit, studioResolveCasting, studioManifestationDraft, studioManifestation);
+      helpers.push(studioRunTemporaryRecipe);
+      entry = `await studioRunTemporaryRecipe(CARD_RECIPE, CARD_INVOCATION, ${recipe.mode === "manifestation" ? "studioManifestation" : "null"});`;
+    } else {
+      helpers.push(studioAddEffect, studioRunChangeRecipe);
+      entry = "await studioRunChangeRecipe(CARD_RECIPE, CARD_INVOCATION);";
+    }
+  }
+  const invocation = watch ? "" : '\nconst CARD_INVOCATION = { actor: typeof actor === "undefined" ? null : actor, spell: typeof spell === "undefined" ? null : spell, options: typeof options === "undefined" ? null : options, cast: typeof cast === "function" ? cast : null };';
+  return `// Generated by Card Macro Studio ${STUDIO_VERSION}. Reopen it in the studio to edit.\n${helpers.map(fn => fn.toString()).join("\n\n")}\n\nconst CARD_RECIPE = ${JSON.stringify(runtimeRecipe, null, 2)};${invocation}\n${entry}\n`;
 }
 
 function studioMacroData(recipe) {
@@ -1051,6 +1273,14 @@ function studioPopulate(form, recipe) {
 
 function studioValidate(recipe) {
   if (!recipe.name) return "Give the macro a name.";
+  const watch = recipe.behavior.watch;
+  if (watch?.enabled && !["card", "result"].includes(recipe.mode)) return "Roll watching is available for Chat Card Only and Choose an Outcome.";
+  if (watch?.enabled && recipe.actorBinding === "none") return "Choose an actor for the roll watcher.";
+  if (watch?.enabled && recipe.behavior.toolbeltSpellMacro) return "A roll watcher cannot be used as a Toolbelt Spell Macro.";
+  if (watch?.enabled && watch.reactiveOnly && watch.type !== "attack-roll") return "Reactive Strike watching requires the Attack Roll type.";
+  if (watch?.enabled && !["attack-roll", "saving-throw", "skill-check", "perception-check", "any"].includes(watch.type)) return "Choose a valid roll type to watch.";
+  if (watch?.enabled && !["any", "criticalSuccess", "success", "failure", "criticalFailure"].includes(watch.outcome)) return "Choose a valid outcome to watch.";
+  if (watch?.enabled && !["source", "self"].includes(watch.visibility)) return "Choose a valid watcher visibility.";
   if (["apply", "transform", "temporary"].includes(recipe.mode) && recipe.actorBinding === "none" && !recipe.behavior.toolbeltSpellMacro) return "Choose an actor for this behavior, or enable Toolbelt spell linking.";
   if (recipe.behavior.effectEnabled && ["apply", "transform"].includes(recipe.mode) && !recipe.behavior.effectUuid.trim()) return "Enter the compendium effect UUID.";
   if (recipe.mode === "temporary" && !recipe.behavior.transitionPath.trim()) return "Enter the temporary token animation path.";
@@ -1074,7 +1304,7 @@ function studioEditor(recipe, existing) {
   const cases = Object.entries(STUDIO_CASES).map(([id, preset]) => `<option value="${id}">${studioEscape(preset.label)}</option>`).join("");
   const macroOptions = existing.map(macro => `<option value="${studioEscape(macro.id)}">${studioEscape(macro.name)}</option>`).join("");
   const content = studioDialogContent(`
-    <div style="color:#fff8ec;line-height:1.35;">
+    <div data-studio-scroll style="color:#fff8ec;line-height:1.35;max-height:min(68vh,650px);overflow-y:auto;overscroll-behavior:contain;padding-right:6px;">
       <div style="display:flex;align-items:center;gap:8px;margin:0 0 8px;">
         <p style="flex:1;margin:0;">Build a reusable card. Artwork and animated decoration are optional.</p>
         <button type="button" data-studio-help aria-label="Open Card Macro Studio tutorial" title="Open tutorial" style="display:flex;align-items:center;justify-content:center;flex:0 0 28px;width:28px;height:28px;min-height:0;margin:0;padding:0;border:1px solid #bca995;border-radius:50%;background:#302a35;color:#fff8ec;font-weight:700;line-height:1;">?</button>
@@ -1092,6 +1322,15 @@ function studioEditor(recipe, existing) {
             ${field("Actor", select("actorBinding", [["assigned", "My assigned character"], ["none", "No actor"], ...ownedActors]))}
             ${field("Scene tokens", select("behavior.tokenScope", [["scene", "All matching owned tokens"], ["selected", "Only selected matching tokens"]]))}
             ${field("Macro icon path", input("icon"))}
+          </details>
+          <details data-watch-settings><summary><strong>Roll watcher (optional)</strong></summary>
+            ${check("behavior.watch.enabled", "Watch the actor's rolls instead of posting when run")}
+            ${field("Roll type", select("behavior.watch.type", [["attack-roll", "Attack rolls"], ["saving-throw", "Saving throws"], ["skill-check", "Skill checks"], ["perception-check", "Perception checks"], ["any", "Any supported check"]]))}
+            ${field("Post on", select("behavior.watch.outcome", [["criticalSuccess", "Critical success"], ["success", "Success"], ["failure", "Failure"], ["criticalFailure", "Critical failure"], ["any", "Any degree of success"]]))}
+            ${check("behavior.watch.reactiveOnly", "Only Reactive Strike (attack rolls)")}
+            ${field("Required PF2e roll option (optional)", input("behavior.watch.requiredOption"), "Exact roll option. Leave blank to accept any matching roll.")}
+            ${field("Card visibility", select("behavior.watch.visibility", [["source", "Match the roll's visibility"], ["self", "Self only"]]))}
+            <p style="font-size:.85em;">Run the generated macro once after connecting to start watching. Run again to stop. An unlabelled Reactive Strike must be marked before rolling; see the tutorial.</p>
           </details>
           <details open><summary><strong>2. Card content</strong></summary>
             ${field("Title", input("card.title"))}
@@ -1152,7 +1391,7 @@ function studioEditor(recipe, existing) {
           <strong>Card preview</strong><p style="font-size:.85em;color:#d3c8b9;">The real chat rendering can differ. Test Card posts a whispered test message.</p>
           <label style="display:block;margin:6px 0;">Outcome to preview <select name="previewOutcome" style="width:100%;color:#fff;background:#302a35;color-scheme:dark;"><option value="criticalSuccess">Critical success</option><option value="success">Success</option><option value="failure">Failure</option><option value="criticalFailure">Critical failure</option></select></label>
           <div data-preview style="width:100%;max-width:280px;padding:8px;background:#2d2930;border-radius:5px;"></div>
-          <p style="font-size:.85em;color:#d3c8b9;">Only an animated image supplies card motion. Outcome mode asks you to choose the result; it does not read a roll.</p>
+          <p style="font-size:.85em;color:#d3c8b9;">Only an animated image supplies card motion. Outcome mode can ask you to choose a result or use the roll watcher.</p>
         </div>
       </div>
     </div>`);
@@ -1166,18 +1405,34 @@ async function studioShowText(title, text) {
     ok: { label: "Close" }, rejectClose: false });
 }
 
+function studioSizeScrollArea(element, form, scroll) {
+  const bounds = element.getBoundingClientRect();
+  const footer = form.querySelector("footer") ?? element.querySelector("footer");
+  const footerHeight = footer?.getBoundingClientRect().height ?? 50;
+  const bottom = Math.min(bounds.bottom, globalThis.innerHeight || bounds.bottom);
+  scroll.style.maxHeight = `${Math.max(80, Math.floor(bottom - scroll.getBoundingClientRect().top - footerHeight - 16))}px`;
+}
+
 async function studioOpen() {
   let draft = studioDefaults();
   let loadedId = "";
   while (true) {
+    let scrollObserver = null;
     const existing = (game.macros?.contents ?? []).filter(macro => macro.flags?.world?.[STUDIO_FLAG]?.schemaVersion === 1)
       .sort((a, b) => a.name.localeCompare(b.name));
     const result = await foundry.applications.api.DialogV2.wait({
       window: { title: `Card Macro Studio ${STUDIO_VERSION}`, resizable: true },
-      position: { width: 850, height: 820 },
+      position: { width: 850, height: Math.max(300, Math.min(820, (globalThis.innerHeight || 860) - 40)) },
       content: studioEditor(draft, existing),
       render: (_event, dialog) => {
         const form = dialog.element.querySelector("form");
+        const scroll = form.querySelector("[data-studio-scroll]");
+        const sizeScrollArea = () => studioSizeScrollArea(dialog.element, form, scroll);
+        sizeScrollArea();
+        if (globalThis.ResizeObserver) {
+          scrollObserver = new ResizeObserver(sizeScrollArea);
+          scrollObserver.observe(dialog.element);
+        }
         studioPopulate(form, draft);
         form.elements.loadedId.value = loadedId;
         if (loadedId) form.querySelector("[data-loaded]").textContent = "Loaded settings. Use Update Loaded to replace that macro, or Create New for a separate copy.";
@@ -1200,6 +1455,14 @@ async function studioOpen() {
             ui.notifications.error(`Could not open the tutorial: ${error.message}`);
           } finally { helpOpen = false; }
         });
+        const syncWatcherControls = () => {
+          const supported = ["card", "result"].includes(form.querySelector('[data-setting="mode"]').value);
+          form.querySelector("[data-watch-settings]").hidden = !supported;
+          if (!supported) form.querySelector('[data-setting="behavior.watch.enabled"]').checked = false;
+          const reactive = form.querySelector('[data-setting="behavior.watch.reactiveOnly"]');
+          reactive.disabled = form.querySelector('[data-setting="behavior.watch.type"]').value !== "attack-roll";
+          if (reactive.disabled) reactive.checked = false;
+        };
         const preview = () => {
           const current = studioFormData(form, draft);
           const previewKey = form.elements.previewOutcome.value;
@@ -1214,6 +1477,7 @@ async function studioOpen() {
         };
         form.addEventListener("input", preview);
         form.addEventListener("change", event => {
+          syncWatcherControls();
           if (event.target.dataset.setting === "card.theme") {
             const theme = STUDIO_THEMES[event.target.value];
             if (theme) for (const key of ["background", "panel", "accent", "text"]) {
@@ -1226,10 +1490,11 @@ async function studioOpen() {
           const macro = game.macros.get(form.elements.loadMacro.value);
           const meta = macro?.flags?.world?.[STUDIO_FLAG];
           if (!meta?.recipe || meta.schemaVersion !== 1) { ui.notifications.warn("Choose a Card Macro Studio macro first."); return; }
-          draft = studioClone(meta.recipe);
+          draft = studioNormalizeRecipe(studioClone(meta.recipe));
           loadedId = macro.id;
           form.elements.loadedId.value = loadedId;
           studioPopulate(form, draft);
+          syncWatcherControls();
           form.querySelector("[data-loaded]").textContent = `Loaded: ${macro.name}. Update it or create a separate copy.`;
           preview();
         });
@@ -1243,10 +1508,13 @@ async function studioOpen() {
           for (let i = 0; i < 3; i++) form.elements[`paragraph${i + 1}`].value = preset.paragraphs[i] ?? "";
           if (preset.mode === "summon") form.querySelector('[data-setting="card.showSummonDetails"]').checked = true;
           if (preset.results) for (const [key, value] of Object.entries(preset.results)) form.querySelector(`[data-setting="results.${key}"]`).value = value;
+          syncWatcherControls();
           preview();
         });
+        syncWatcherControls();
         preview();
       },
+      close: () => scrollObserver?.disconnect(),
       buttons: [
         { action: "create", label: "Create New", default: true, callback: (_event, button) => ({ action: "create", recipe: studioFormData(button.form, draft), loadedId: button.form.elements.loadedId.value }) },
         { action: "update", label: "Update Loaded", callback: (_event, button) => ({ action: "update", recipe: studioFormData(button.form, draft), loadedId: button.form.elements.loadedId.value }) },
